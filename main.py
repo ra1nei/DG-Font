@@ -24,7 +24,7 @@ from train.train import trainGAN
 from validation.validation import validateUN
 
 from tools.utils import *
-from datasets.datasetgetter import get_dataset
+from dataset.datasetgetter import get_dataset
 from tools.ops import initialize_queue
 
 from tensorboardX import SummaryWriter
