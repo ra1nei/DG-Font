@@ -117,7 +117,7 @@ class DatasetFolder(data.Dataset):
         else:
             classes = [d for d in os.listdir(dir) if os.path.isdir(os.path.join(dir, d))]
         classes.sort()
-        classes.sort(key= lambda x:int(x[3:]))
+        # classes.sort(key= lambda x:int(x[3:]))
         class_to_idx = {classes[i]: i for i in range(len(classes))}
         return classes, class_to_idx
 
