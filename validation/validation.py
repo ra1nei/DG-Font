@@ -47,13 +47,20 @@ def validateUN(data_loader, networks, epoch, args, additional=None):
                                                  num_workers=0, pin_memory=True, drop_last=False)
             tmp_iter = iter(tmp_dl)
             tmp_sample = None
-            for sample_idx in range(len(tmp_iter)):
-                imgs, _ = next(tmp_iter)
-                x_ = imgs
-                if tmp_sample is None:
-                    tmp_sample = x_.clone()
-                else:
-                    tmp_sample = torch.cat((tmp_sample, x_), 0)
+            if len(tmp_dl) == 0:
+                print(f"Warning: No images found for class index {cls_idx} (Val Set).")
+            else:
+                for sample_idx in range(len(tmp_iter)):
+                    imgs, _ = next(tmp_iter)
+                    x_ = imgs
+                    if tmp_sample is None:
+                        tmp_sample = x_.clone()
+                    else:
+                        tmp_sample = torch.cat((tmp_sample, x_), 0)
+            
+            if tmp_sample is None:
+                 raise ValueError(f"Validation set empty for class {args.att_to_use[cls_idx]}")
+                 
             x_each_cls.append(tmp_sample)
     
     
