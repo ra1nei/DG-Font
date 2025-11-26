@@ -1,89 +1,81 @@
-#!/usr/bin/env python
-from __future__ import absolute_import
-from __future__ import print_function
-from __future__ import division
-
 import torch
 from torch import nn
-from torch.autograd import Function
-from torch.nn.modules.utils import _pair
-from torch.autograd.function import once_differentiable
-
-# DCNv3 from OpenGVLab
-from dcnv3 import dcnv3_core_pytorch as dcnv3
+import torchvision.ops
 
 
-class ModulatedDeformConvFunction(Function):
+class ModulatedDeformConvFunction(object):
+    
     @staticmethod
-    def forward(ctx, input, offset, mask, weight, bias,
-                stride, padding, dilation, groups, deformable_groups, im2col_step):
-
-        # Standardize params
-        stride = _pair(stride)
-        padding = _pair(padding)
-        dilation = _pair(dilation)
-        kernel_size = _pair(weight.shape[2:4])
-
-        output = dcnv3(
-            input,
-            offset,
-            mask,
-            weight,
-            bias,
-            stride,
-            padding,
-            dilation,
-            groups,
-            deformable_groups
+    def apply(input, offset, mask, weight, bias, 
+              stride, padding, dilation, groups, deformable_groups, im2col_step):
+        
+        # im2col_step là tham số tối ưu bộ nhớ của repo cũ, 
+        # torchvision tự động xử lý nên ta không cần dùng nhưng vẫn giữ tham số để không lỗi code gọi.
+        
+        # Chuyển đổi stride, padding, dilation về dạng tuple nếu cần (giống _pair)
+        # torchvision nhận cả int và tuple nên thường không cần convert gắt gao,
+        # nhưng để an toàn ta cứ truyền thẳng vào.
+        
+        return torchvision.ops.deform_conv2d(
+            input=input,
+            offset=offset,
+            weight=weight,
+            bias=bias,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            mask=mask
         )
 
-        # Save for backward
-        ctx.save_for_backward(input, offset, mask, weight, bias)
-        ctx.stride = stride
-        ctx.padding = padding
-        ctx.dilation = dilation
-        ctx.kernel_size = kernel_size
-        ctx.groups = groups
-        ctx.deformable_groups = deformable_groups
+class ModulatedDeformConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, dilation=1, groups=1, deformable_groups=1, bias=True):
+        super(ModulatedDeformConv, self).__init__()
+        
+        if isinstance(kernel_size, int):
+            self.kernel_size = (kernel_size, kernel_size)
+        else:
+            self.kernel_size = kernel_size
+            
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self.deformable_groups = deformable_groups
+        
+        # Weight shape: [out_channels, in_channels // groups, *kernel_size]
+        self.weight = nn.Parameter(
+            torch.Tensor(out_channels, in_channels // groups, *self.kernel_size)
+        )
+        
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter('bias', None)
+            
+        self.reset_parameters()
 
-        return output
+    def reset_parameters(self):
+        n = self.in_channels
+        for k in self.kernel_size:
+            n *= k
+        stdv = 1. / math.sqrt(n)
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
 
-    @staticmethod
-    @once_differentiable
-    def backward(ctx, grad_output):
-        """
-        DCNv3 has a built-in autograd implementation.
-        Just call autograd.grad.
-        """
-        input, offset, mask, weight, bias = ctx.saved_tensors
-
-        # Let PyTorch autograd compute gradients
-        grads = torch.autograd.grad(
-            outputs=dcnv3(
-                input,
-                offset,
-                mask,
-                weight,
-                bias,
-                ctx.stride,
-                ctx.padding,
-                ctx.dilation,
-                ctx.groups,
-                ctx.deformable_groups
-            ),
-            inputs=(input, offset, mask, weight, bias),
-            grad_outputs=grad_output,
-            allow_unused=True,
-            retain_graph=False
+    def forward(self, input, offset, mask):
+        return torchvision.ops.deform_conv2d(
+            input, 
+            offset, 
+            self.weight, 
+            self.bias, 
+            stride=self.stride, 
+            padding=self.padding, 
+            dilation=self.dilation, 
+            mask=mask
         )
 
-        grad_input, grad_offset, grad_mask, grad_weight, grad_bias = grads
-
-        return (
-            grad_input,
-            grad_offset,
-            grad_mask,
-            grad_weight,
-            grad_bias,
-            None, None, None, None, None, None
-        )
+    @property
+    def in_channels(self):
+        return self.weight.shape[1] * self.groups
