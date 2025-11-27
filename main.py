@@ -316,34 +316,95 @@ def build_model(args):
 
 
 def load_model(args, networks, opts):
-    if args.load_model is not None:
-        check_load = open(os.path.join(args.log_dir, "checkpoint.txt"), 'r')
-        to_restore = check_load.readlines()[-1].strip()
-        load_file = os.path.join(args.log_dir, to_restore)
-        if os.path.isfile(load_file):
-            print("=> loading checkpoint '{}'".format(load_file))
-            checkpoint = torch.load(load_file, map_location='cpu')
-            args.start_epoch = checkpoint['epoch']
-            if not args.multiprocessing_distributed:
-                for name, net in networks.items():
-                    tmp_keys = next(iter(checkpoint[name + '_state_dict'].keys()))
-                    if 'module' in tmp_keys:
-                        tmp_new_dict = OrderedDict()
-                        for key, val in checkpoint[name + '_state_dict'].items():
-                            tmp_new_dict[key[7:]] = val
-                        net.load_state_dict(tmp_new_dict)
-                        networks[name] = net
-                    else:
-                        net.load_state_dict(checkpoint[name + '_state_dict'])
-                        networks[name] = net
+    # 1. Kiểm tra tham số đầu vào
+    if args.load_model in [None, '']:
+        if args.load_model_oss in [None, '']:
+            print('Warning! No model to load.')
+            return
+        # Xử lý trường hợp OSS cũ (có thể bỏ qua nếu không dùng)
+        args.load_model_oss = ''
 
-            for name, opt in opts.items():
+    load_file = None
+    
+    # === LOGIC XỬ LÝ ĐƯỜNG DẪN ===
+    
+    # TRƯỜNG HỢP 1: args.load_model là FOLDER (đúng ý bạn muốn)
+    if os.path.isdir(args.load_model):
+        print(f"=> Input is a directory: {args.load_model}")
+        # Tìm file checkpoint.txt nằm NGAY TRONG folder đó
+        ckpt_txt_path = os.path.join(args.load_model, "checkpoint.txt")
+        
+        if os.path.isfile(ckpt_txt_path):
+            try:
+                # Đọc file txt để lấy tên file model (vd: model_epoch_200.pth)
+                with open(ckpt_txt_path, 'r') as f:
+                    # Lấy dòng cuối cùng, xóa khoảng trắng thừa
+                    model_filename = f.readlines()[-1].strip()
+                
+                # Ghép đường dẫn: Folder + Tên file model
+                load_file = os.path.join(args.load_model, model_filename)
+                print(f"=> Found checkpoint info: {model_filename}")
+            except Exception as e:
+                print(f"Error reading checkpoint.txt: {e}")
+                return
+        else:
+            print(f"Error: Directory found but 'checkpoint.txt' is missing in {args.load_model}")
+            # (Tùy chọn) Nếu muốn tự tìm file .pth mới nhất khi thiếu file txt thì code thêm ở đây
+            return
+
+    # TRƯỜNG HỢP 2: args.load_model là FILE .pth/.ckpt (Load trực tiếp)
+    elif os.path.isfile(args.load_model):
+        # Nếu trỏ thẳng vào file .txt thì đọc nội dung, nếu trỏ vào .pth thì lấy luôn
+        if args.load_model.endswith('.txt'):
+            with open(args.load_model, 'r') as f:
+                model_filename = f.readlines()[-1].strip()
+            # Giả định file model nằm cùng chỗ với file txt
+            load_file = os.path.join(os.path.dirname(args.load_model), model_filename)
+        else:
+            load_file = args.load_model
+
+    else:
+        print(f"Error: Path not found: {args.load_model}")
+        return
+
+    # === TIẾN HÀNH LOAD FILE ===
+    if load_file and os.path.isfile(load_file):
+        if local_rank == 0:
+            print("=> Loading checkpoint '{}'".format(load_file))
+        
+        # Load vào CPU trước để an toàn
+        checkpoint = torch.load(load_file, map_location='cpu')
+        args.start_epoch = checkpoint['epoch']
+
+        # Load Weights (xử lý module. cho DDP)
+        for name, net in networks.items():
+            state_dict = checkpoint[name + '_state_dict']
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                # Logic loại bỏ hoặc thêm 'module.' để khớp với model hiện tại
+                if k.startswith('module.') and not isinstance(net, torch.nn.parallel.DistributedDataParallel):
+                    name_key = k[7:] 
+                elif not k.startswith('module.') and isinstance(net, torch.nn.parallel.DistributedDataParallel):
+                    name_key = 'module.' + k
+                else:
+                    name_key = k
+                new_state_dict[name_key] = v
+            
+            net.load_state_dict(new_state_dict, strict=False)
+            networks[name] = net
+
+        # Load Optimizer
+        for name, opt in opts.items():
+            if name.lower() + '_optimizer' in checkpoint:
                 opt.load_state_dict(checkpoint[name.lower() + '_optimizer'])
                 opts[name] = opt
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(load_file, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.log_dir))
+        
+        if local_rank == 0:
+            print(f"=> Successfully loaded checkpoint (epoch {checkpoint['epoch']})")
+    else:
+        if local_rank == 0:
+            print(f"=> Critical: Checkpoint file defined but not found at '{load_file}'")
+
 
 
 def get_loader(args, dataset):
