@@ -1,153 +1,245 @@
-import argparse
 import os
-import random
+import random, string
 import torch
-from torchvision import transforms
-from torchvision.utils import save_image
 from PIL import Image
+from datetime import datetime
+from torchvision import transforms
+import numpy as np
+from sample import load_fontdiffuer_pipeline
+from utils import save_image_with_content_style   # dùng lại utils
 from tqdm import tqdm
-from pathlib import Path
+# Nếu bạn muốn override hàm utils, bỏ comment dòng dưới và xóa import ở trên
+# (nhưng theo yêu cầu thì giữ nguyên import)
 
-# Import model definitions
-# Giả sử file này đặt cùng cấp với folder models
-from models.generator import Generator
-from models.guidingNet import GuidingNet
 
-def load_image(path, size):
-    """Load ảnh, resize và chuẩn hóa về [-1, 1]"""
-    transform = transforms.Compose([
-        transforms.Resize((size, size)),
+# ======================
+# UTILS
+# ======================
+def preprocess_image(path, size, device="cuda"):
+    tfm = transforms.Compose([
+        transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        transforms.Normalize([0.5], [0.5]),
     ])
-    try:
-        img = Image.open(path).convert('RGB')
-        return transform(img).unsqueeze(0) # Thêm batch dimension: [1, 3, H, W]
-    except Exception as e:
-        print(f"Error loading image {path}: {e}")
-        return None
+    img = Image.open(path).convert("RGB")
+    return tfm(img)[None, :].to(device)
 
+
+def collect_images(root_dir):
+    """Thu thập toàn bộ ảnh .png, .jpg, .jpeg trong thư mục"""
+    return [
+        os.path.join(root, f)
+        for root, _, files in os.walk(root_dir)
+        for f in files if f.lower().endswith((".png", ".jpg", ".jpeg"))
+    ] if os.path.exists(root_dir) else []
+
+
+def save_single_image(save_dir, image, filename):
+    """Lưu ảnh PIL vào thư mục"""
+    os.makedirs(save_dir, exist_ok=True)
+    image.save(os.path.join(save_dir, filename))
+
+
+def load_image_tensor(path, size=None):
+    img = Image.open(path).convert("RGB")
+    if size is not None:
+        img = img.resize(size)
+    return img
+
+
+
+# ======================
+# NEW FUNCTION (FULL)
+# ======================
+def save_image_with_content_style(
+    save_dir,
+    gen_image_pil,
+    content_image_pil=None,
+    content_image_path=None,
+    style_image_path=None,
+    resolution=(128, 128),
+    filename="out_with_cs.jpg"
+):
+    """
+    Tạo ảnh ghép: [content | style | generated]
+
+    Args:
+        save_dir (str): thư mục lưu
+        gen_image_pil (PIL.Image): ảnh generated
+        content_image_pil (PIL.Image or None): ảnh content PIL nếu có
+        content_image_path (str or None): đường dẫn ảnh content
+        style_image_path (str): đường dẫn ảnh style
+        resolution (tuple): (W, H)
+        filename (str): tên file ảnh
+
+    Returns:
+        save_path (str): đường dẫn ảnh đã lưu
+    """
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    W, H = resolution
+
+    # ----- load content -----
+    if content_image_pil is not None:
+        content = content_image_pil.resize((W, H))
+    else:
+        content = Image.open(content_image_path).convert("RGB").resize((W, H))
+
+    # ----- load style -----
+    style = Image.open(style_image_path).convert("RGB").resize((W, H))
+
+    # ----- generated -----
+    gen = gen_image_pil.resize((W, H))
+
+    # ----- create merged canvas -----
+    merged = Image.new("RGB", (W * 3, H))
+    merged.paste(content, (0, 0))
+    merged.paste(style, (W, 0))
+    merged.paste(gen, (W * 2, 0))
+
+    save_path = os.path.join(save_dir, filename)
+    merged.save(save_path)
+
+    return save_path
+
+
+
+
+# ======================
+# MAIN SAMPLING
+# ======================
+def batch_sampling(args):
+    pipe = load_fontdiffuer_pipeline(args)
+    os.makedirs(args.save_dir, exist_ok=True)
+    random.seed(123)
+
+    chinese_images = collect_images(args.chinese_dir)
+    print(f"Tổng số ảnh Chinese: {len(chinese_images)}")
+
+    samples = []
+    for chi_path in chinese_images:
+        font_name = os.path.basename(os.path.dirname(chi_path))
+        glyph_name = os.path.splitext(os.path.basename(chi_path))[0]
+
+        # CONTENT
+        content_path = os.path.join(args.source_dir, f"{glyph_name}.png")
+        # STYLE
+        style_dir = os.path.join(args.english_dir, font_name)
+
+        if args.random_style:
+            style_candidates = [
+                f for f in os.listdir(style_dir)
+                if f.lower().endswith((".png", ".jpg", ".jpeg"))
+            ]
+            style_file = random.choice(style_candidates)
+
+        else:
+            style_file = "a.png"
+
+        style_path = os.path.join(style_dir, style_file)
+
+        if not (os.path.exists(content_path) and os.path.exists(style_path)):
+            continue
+
+        samples.append({
+            "content": content_path,
+            "style": style_path,
+            "target": chi_path,
+            "font": font_name,
+            "glyph": glyph_name
+        })
+
+    print(f"Tổng số mẫu hợp lệ: {len(samples)}")
+
+    for s in tqdm(samples, desc="🔄 Running inference", ncols=100):
+        font_name, glyph_name = s["font"], s["glyph"]
+        content_path, style_path, target_path = s["content"], s["style"], s["target"]
+
+        content_img = preprocess_image(content_path, args.content_image_size, args.device)
+        style_img = preprocess_image(style_path, args.style_image_size, args.device)
+
+        with torch.no_grad():
+            out_imgs = pipe.generate(
+                content_images=content_img,
+                style_images=style_img,
+                batch_size=1,
+                order=args.order,
+                num_inference_step=args.num_inference_steps,
+                content_encoder_downsample_size=args.content_encoder_downsample_size,
+                t_start=args.t_start,
+                t_end=args.t_end,
+                dm_size=args.content_image_size[0],
+                algorithm_type=args.algorithm_type,
+                skip_type=args.skip_type,
+                method=args.method,
+                correcting_x0_fn=args.correcting_x0_fn,
+            )
+
+        out_img = out_imgs[0]
+        if isinstance(out_img, torch.Tensor):
+            out_pil = Image.fromarray(
+                ((out_img / 2 + 0.5).clamp(0, 1)
+                .permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            )
+        else:
+            out_pil = out_img
+
+        # ensure correct resolution
+        out_pil = out_pil.resize(args.content_image_size)
+
+        # Tên file như yêu cầu
+        gen_filename = f"{font_name}|{glyph_name}|generated_images.png"
+        gt_filename = f"{font_name}|{glyph_name}|gt_images.png"
+
+        # Lưu ảnh generated và groundtruth
+        save_single_image(args.save_dir, out_pil, gen_filename)
+        target_pil = load_image_tensor(target_path, args.content_image_size)
+        save_single_image(args.save_dir, target_pil, gt_filename)
+
+        # ================================
+        # Lưu ảnh ghép content-style-gen
+        # ================================
+        # merged_filename = f"{font_name}|{glyph_name}|merged.png"
+        # save_image_with_content_style(
+        #     save_dir=args.save_dir,
+        #     gen_image_pil=out_pil,
+        #     content_image_path=content_path,
+        #     style_image_path=style_path,
+        #     resolution=args.content_image_size,
+        #     filename=merged_filename
+        # )
+
+    print(f"\n✅ Hoàn tất inference, ảnh lưu trong: {args.save_dir}")
+
+
+
+# ======================
+# ENTRY
+# ======================
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--style_dir', type=str, required=True, help='Folder chứa các folder font Latin (English)')
-    parser.add_argument('--content_dir', type=str, required=True, help='Folder chứa ảnh chữ Hán (Chinese/Source)')
-    parser.add_argument('--ckpt_path', type=str, required=True, help='Đường dẫn file .ckpt')
-    parser.add_argument('--output_dir', type=str, default='results_cross', help='Nơi lưu kết quả')
-    
-    parser.add_argument('--img_size', type=int, default=80)
-    parser.add_argument('--sty_dim', type=int, default=128)
-    parser.add_argument('--gpu', type=int, default=0)
-    
+    from configs.fontdiffuser import get_parser
+    parser = get_parser()
+    parser.add_argument("--ckpt_dir", type=str, required=True)
+    parser.add_argument("--source_dir", type=str, required=True)
+    parser.add_argument("--english_dir", type=str, required=True)
+    parser.add_argument("--chinese_dir", type=str, required=True)
+    parser.add_argument("--save_dir", type=str, default="/kaggle/working/results/")
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--name", type=str)
+    parser.add_argument("--model", type=str)
+    parser.add_argument("--random_style", action="store_true",
+                    help="Nếu bật thì chọn style random từ a-z (viết thường), và dùng file Upper+.png")
+
     args = parser.parse_args()
 
-    # 1. Setup Device & Model
-    device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    os.makedirs(args.save_dir, exist_ok=True)
+    test_img = Image.open(os.path.join(args.source_dir, os.listdir(args.source_dir)[0]))
+    args.content_image_size = args.style_image_size = test_img.size
+    print(f"⛏ Auto-detected image size:", args.content_image_size)
 
-    # Khởi tạo model
-    C = GuidingNet(args.img_size, {'cont': args.sty_dim, 'disc': 400})
-    G = Generator(args.img_size, args.sty_dim, use_sn=False)
+    batch_sampling(args)
 
-    C.to(device)
-    G.to(device)
-    C.eval()
-    G.eval()
 
-    # Load Checkpoint
-    print(f"Loading checkpoint: {args.ckpt_path}")
-    checkpoint = torch.load(args.ckpt_path, map_location=device)
-    
-    def remove_module_prefix(state_dict):
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            k = k.replace('module.', '')
-            new_state_dict[k] = v
-        return new_state_dict
-
-    # Load weights thông minh (ưu tiên EMA nếu có)
-    c_state = checkpoint.get('C_EMA_state_dict', checkpoint.get('C_state_dict'))
-    g_state = checkpoint.get('G_EMA_state_dict', checkpoint.get('G_state_dict'))
-    
-    C.load_state_dict(remove_module_prefix(c_state))
-    G.load_state_dict(remove_module_prefix(g_state))
-
-    # 2. Quét dữ liệu
-    # Lấy danh sách các folder Font trong thư mục English (Style)
-    # Cấu trúc mong đợi: args.style_dir/FontName/image.png
-    style_fonts = [d for d in os.listdir(args.style_dir) if os.path.isdir(os.path.join(args.style_dir, d))]
-    style_fonts.sort()
-    
-    # Lấy danh sách ảnh Content (Hán)
-    # Hỗ trợ cả việc content_dir chứa ảnh trực tiếp hoặc chứa subfolder
-    content_images = []
-    for root, dirs, files in os.walk(args.content_dir):
-        for file in files:
-            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                content_images.append(os.path.join(root, file))
-    
-    print(f"Found {len(style_fonts)} Latin styles.")
-    print(f"Found {len(content_images)} Chinese content glyphs.")
-
-    if len(style_fonts) == 0 or len(content_images) == 0:
-        print("Error: No data found check your paths.")
-        return
-
-    # Tạo thư mục output
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
-
-    # 3. Vòng lặp Inference
-    # Logic: Với mỗi Font Latin -> Chọn 1 ảnh ngẫu nhiên làm Style -> Áp dụng lên TẤT CẢ ảnh Hán
-    
-    with torch.no_grad():
-        for style_font_name in tqdm(style_fonts, desc="Processing Styles"):
-            style_font_path = os.path.join(args.style_dir, style_font_name)
-            
-            # Lấy danh sách ảnh trong folder font này
-            style_imgs_list = [f for f in os.listdir(style_font_path) if f.lower().endswith(('.png', '.jpg'))]
-            
-            if not style_imgs_list:
-                continue
-
-            # --- KEY LOGIC: Lấy ngẫu nhiên 1 ký tự Latin làm mẫu Style ---
-            random_style_img_name = random.choice(style_imgs_list)
-            style_img_abs_path = os.path.join(style_font_path, random_style_img_name)
-            
-            # Load Style Image
-            img_style_tensor = load_image(style_img_abs_path, args.img_size)
-            if img_style_tensor is None: continue
-            img_style_tensor = img_style_tensor.to(device)
-
-            # Tính toán Style Code (s_ref) MỘT LẦN cho cả font này để nhanh hơn
-            s_ref = C(img_style_tensor, sty=True)
-
-            # Tạo folder kết quả cho font style này
-            save_folder = os.path.join(args.output_dir, style_font_name)
-            if not os.path.exists(save_folder):
-                os.makedirs(save_folder)
-
-            # Duyệt qua từng ảnh Content (Hán)
-            for content_path in content_images:
-                img_content_tensor = load_image(content_path, args.img_size)
-                if img_content_tensor is None: continue
-                img_content_tensor = img_content_tensor.to(device)
-
-                # Tính Content Code
-                c_src, skip1, skip2 = C(img_content_tensor, cont=True)
-
-                # Generator: Content Hán + Style Latin
-                output, _ = G.decode(c_src, s_ref, skip1, skip2)
-
-                # Denormalize
-                output = (output + 1) / 2.0
-                
-                # Lưu ảnh
-                # Tên file: {Tên_gốc_của_chữ_Hán}.png
-                content_name = os.path.splitext(os.path.basename(content_path))[0]
-                save_path = os.path.join(save_folder, f"{content_name}.png")
-                save_image(output, save_path)
-                
-    print(f"Done! Results saved to {args.output_dir}")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
