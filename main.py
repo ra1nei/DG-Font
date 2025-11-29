@@ -218,7 +218,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # All the test is done in the training - do not need to call
     if args.validation:
-        # validationFunc(val_loader, networks, 999, args, {'logger': logger})
+        validationFunc(val_loader, networks, 999, args, {'logger': logger})
         return
 
     # For saving the model
