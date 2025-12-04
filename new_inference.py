@@ -1,199 +1,281 @@
-import argparse
 import os
+import argparse
+import random
 import torch
+import torch.nn as nn
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
 from PIL import Image
-import numpy as np
+from tqdm import tqdm
 from collections import OrderedDict
+import numpy as np
 
 # --- IMPORTS TỪ SOURCE CODE GỐC ---
-# Giả định file này nằm cùng thư mục gốc với main.py để có thể truy cập folder 'models'
 try:
     from models.generator import Generator
     from models.guidingNet import GuidingNet
 except ImportError:
-    print("Lỗi: Không tìm thấy thư mục 'models'. Hãy đảm bảo bạn chạy script này từ thư mục gốc của dự án (nơi chứa main.py và thư mục models).")
+    print("❌ Lỗi: Không tìm thấy thư mục 'models'. Hãy đảm bảo bạn chạy script này từ thư mục gốc của dự án.")
     exit(1)
 
-# --- HELPER FUNCTIONS ---
+# ======================
+# UTILS
+# ======================
 
-def load_image(image_path, img_size, device):
+def load_image_tensor(path, size, device):
     """
-    Tải và tiền xử lý hình ảnh đầu vào.
-    Chuyển đổi sang Grayscale nếu mô hình yêu cầu (thường font là grayscale), 
-    nhưng based on main.py channels seems implied standard. 
-    Code gốc main.py dùng datasetgetter, thường trả về tensor chuẩn hóa.
+    Load ảnh, resize, và chuẩn hóa về [-1, 1] cho GAN
     """
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"Không tìm thấy file ảnh: {image_path}")
-
-    # Transform giống như quy trình training thường dùng cho GAN
-    transform = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
+    if not os.path.exists(path):
+        return None
+    
+    # Transform chuẩn cho GAN (thường là mean 0.5, std 0.5 để về range [-1, 1])
+    tfm = transforms.Compose([
+        transforms.Resize((size, size)),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
     
-    image = Image.open(image_path).convert('RGB')
-    image_tensor = transform(image).unsqueeze(0).to(device) # Thêm batch dimension
-    return image_tensor
+    try:
+        img = Image.open(path).convert("RGB")
+        return tfm(img).unsqueeze(0).to(device) # Thêm batch dimension [1, C, H, W]
+    except Exception as e:
+        print(f"Lỗi đọc ảnh {path}: {e}")
+        return None
 
-def load_models(args, device):
+def save_image_with_content_style(save_dir, gen_tensor, content_path, style_path, filename):
     """
-    Khởi tạo và tải trọng các mô hình G_EMA và C_EMA dựa trên cấu trúc trong main.py.
+    Lưu ảnh ghép: [Content | Style | Generated]
     """
-    print(f"Đang khởi tạo các mô hình trên device: {device}")
+    os.makedirs(save_dir, exist_ok=True)
     
-    # 1. Khởi tạo Mô hình (Dựa trên main.py build_model)
-    # G: Generator
-    # C: GuidingNet
+    # Denormalize generated tensor từ [-1, 1] về [0, 1] để lưu
+    gen_tensor = (gen_tensor.clone().detach().cpu() * 0.5 + 0.5).clamp(0, 1)
     
-    # Cấu hình từ main.py:
-    # networks['G'] = Generator(args.img_size, args.sty_dim, use_sn=False)
-    # networks['C'] = GuidingNet(args.img_size, {'cont': args.sty_dim, 'disc': args.output_k})
+    # Convert sang PIL
+    gen_pil = transforms.ToPILImage()(gen_tensor.squeeze(0))
+    
+    # Resize các ảnh khác về cùng kích thước với Gen
+    W, H = gen_pil.size
+    
+    try:
+        content_pil = Image.open(content_path).convert("RGB").resize((W, H))
+        style_pil = Image.open(style_path).convert("RGB").resize((W, H))
+        
+        # Tạo canvas
+        merged = Image.new("RGB", (W * 3, H))
+        merged.paste(content_pil, (0, 0))
+        merged.paste(style_pil, (W, 0))
+        merged.paste(gen_pil, (W * 2, 0))
+        
+        save_path = os.path.join(save_dir, filename)
+        merged.save(save_path)
+    except Exception as e:
+        print(f"Lỗi khi lưu ảnh ghép {filename}: {e}")
+
+def load_gan_models(args, device):
+    """
+    Khởi tạo và load weight cho G_EMA và C_EMA
+    """
+    print(f"🔄 Đang tải mô hình từ: {args.checkpoint_path}")
     
     G_EMA = Generator(args.img_size, args.sty_dim, use_sn=False).to(device)
     C_EMA = GuidingNet(args.img_size, {'cont': args.sty_dim, 'disc': args.output_k}).to(device)
 
-    # 2. Tải Checkpoint
     if not os.path.exists(args.checkpoint_path):
-        raise FileNotFoundError(f"Không tìm thấy checkpoint tại: {args.checkpoint_path}")
-        
-    print(f"Loading checkpoint from {args.checkpoint_path}")
+        raise FileNotFoundError(f"Không tìm thấy checkpoint: {args.checkpoint_path}")
+
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
-    
-    # Hàm helper để tải state_dict (xử lý 'module.' prefix nếu train bằng DataParallel)
-    def load_state_dict_safe(model, state_dict_key):
-        if state_dict_key not in checkpoint:
-            print(f"Warning: Key {state_dict_key} not found in checkpoint.")
-            return False
-            
-        state_dict = checkpoint[state_dict_key]
+
+    def clean_state_dict(state_dict):
         new_state_dict = OrderedDict()
-        
-        # Kiểm tra xem có cần loại bỏ prefix 'module.' không
         for k, v in state_dict.items():
             name = k[7:] if k.startswith('module.') else k
             new_state_dict[name] = v
-            
-        model.load_state_dict(new_state_dict)
-        return True
+        return new_state_dict
 
-    # 3. Tải trọng số cho G_EMA
-    # Trong main.py save_model, key là 'G_EMA_state_dict'
-    if not load_state_dict_safe(G_EMA, 'G_EMA_state_dict'):
-        print("Đang thử tải trọng số G thường (không phải EMA)...")
-        load_state_dict_safe(G_EMA, 'G_state_dict')
+    # Load G_EMA
+    if 'G_EMA_state_dict' in checkpoint:
+        G_EMA.load_state_dict(clean_state_dict(checkpoint['G_EMA_state_dict']))
+    else:
+        print("⚠️ Warning: Không thấy G_EMA, dùng G thường.")
+        G_EMA.load_state_dict(clean_state_dict(checkpoint['G_state_dict']))
 
-    # 4. Tải trọng số cho C_EMA
-    # Trong main.py save_model, key là 'C_EMA_state_dict' (lưu ý: main.py skip saving EMA cho C/G nếu là distributed?? 
-    # Check lại main.py: save_model skip G_EMA, C_EMA? 
-    # Dòng 377 main.py: if name in ['G_EMA', 'C_EMA']: continue. 
-    # NHƯNG validation.py dùng G_EMA. Vậy checkpoint load từ đâu?
-    # À, main.py dòng 330 khởi tạo G_EMA. 
-    # Nếu checkpoint không lưu G_EMA riêng, ta load từ G_state_dict.
-    
-    if not load_state_dict_safe(C_EMA, 'C_EMA_state_dict'):
-        print("Không tìm thấy C_EMA, tải từ C_state_dict...")
-        load_state_dict_safe(C_EMA, 'C_state_dict')
+    # Load C_EMA
+    if 'C_EMA_state_dict' in checkpoint:
+        C_EMA.load_state_dict(clean_state_dict(checkpoint['C_EMA_state_dict']))
+    else:
+        print("⚠️ Warning: Không thấy C_EMA, dùng C thường.")
+        C_EMA.load_state_dict(clean_state_dict(checkpoint['C_state_dict']))
 
-    # Đảm bảo các mô hình ở chế độ đánh giá
     G_EMA.eval()
     C_EMA.eval()
     
     return G_EMA, C_EMA
 
+def collect_files(root_dir):
+    """Thu thập file ảnh đệ quy"""
+    files = []
+    for root, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                files.append(os.path.join(root, filename))
+    return files
+
+# ======================
+# MAIN LOGIC
+# ======================
+
 def run_inference(args):
-    """
-    Thực hiện toàn bộ quá trình inference: tách Content, trích xuất Style và tổng hợp.
-    """
-    # 1. Cấu hình Device
-    if args.gpu is not None and torch.cuda.is_available():
-        device = torch.device(f'cuda:{args.gpu}')
-        torch.cuda.set_device(args.gpu)
-    else:
-        device = torch.device('cpu')
-    
-    print(f"Thiết bị được chọn: {device}")
+    # 1. Setup Device
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu != -1 else "cpu")
+    print(f"⚙️ Thiết bị: {device}")
 
-    # 2. Tải Mô hình
+    # 2. Load Models
     try:
-        G_EMA, C_EMA = load_models(args, device)
+        G_EMA, C_EMA = load_gan_models(args, device)
     except Exception as e:
-        print(f"Lỗi xảy ra khi tải/khởi tạo mô hình: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Lỗi load model: {e}")
         return
+
+    # 3. Thu thập danh sách ảnh Target (Chinese)
+    print(f"📂 Đang quét thư mục target: {args.chinese_dir}")
+    chinese_images = collect_files(args.chinese_dir)
+    print(f"📊 Tìm thấy {len(chinese_images)} ảnh target.")
+
+    # 4. Chuẩn bị danh sách samples (Matching logic)
+    samples = []
     
-    # 3. Tải Hình ảnh
-    try:
-        x_src = load_image(args.source_image, args.img_size, device)
-        x_ref = load_image(args.reference_image, args.img_size, device)
-    except FileNotFoundError as e:
-        print(f"Lỗi tải hình ảnh: {e}")
-        return
+    # Logic random style seed
+    random.seed(42) 
+
+    for chi_path in chinese_images:
+        # Cấu trúc: .../chinese/FontName/GlyphName.png
+        font_name = os.path.basename(os.path.dirname(chi_path)) # Tên Font
+        glyph_name = os.path.splitext(os.path.basename(chi_path))[0] # Tên chữ (vd: 丁)
+
+        # A. Xác định Content Path (Source)
+        # Giả định source nằm trong args.source_dir/GlyphName.png
+        # (Hoặc nếu source cũng chia folder thì cần sửa lại logic này tùy cấu trúc source của bạn)
+        # Theo đề bài: "lấy glyph của ảnh đó trong source làm ảnh content" -> source_dir/glyph_name.png
+        content_path = os.path.join(args.source_dir, f"{glyph_name}.png")
+        
+        # Fallback nếu trong source nó nằm trong folder con (ví dụ source/A+/glyph.png)
+        if not os.path.exists(content_path):
+             # Thử tìm đệ quy hoặc giả định một cấu trúc khác nếu cần. 
+             # Hiện tại giữ simple: source_dir/glyph.png
+             pass
+
+        # B. Xác định Style Path (English)
+        # Style nằm trong: english_dir/FontName/...
+        style_dir = os.path.join(args.english_dir, font_name)
+        
+        if not os.path.exists(style_dir):
+            continue # Không có folder style tương ứng font này -> Skip
+
+        # Logic chọn file Style (Random vs Fixed)
+        style_file = None
+        
+        if args.random_style:
+            # Lấy danh sách ảnh trong folder style đó
+            candidates = [f for f in os.listdir(style_dir) if f.lower().endswith(('.png', '.jpg'))]
+            
+            # Lọc theo mode nếu cần (ví dụ chỉ lấy chữ hoa)
+            if args.random_mode == "upper":
+                # Lọc thô sơ: Tên file dài 1 ký tự và là chữ hoa (A.png) hoặc A+.png
+                candidates = [f for f in candidates if f[0].isupper()]
+            
+            if candidates:
+                style_file = random.choice(candidates)
+        else:
+            # Fixed style (ví dụ chọn 'A+.png' hoặc 'a.png')
+            # Thử tìm file chính xác
+            possible_names = [args.fixed_style, args.fixed_style + ".png", args.fixed_style + ".jpg"]
+            for name in possible_names:
+                if os.path.exists(os.path.join(style_dir, name)):
+                    style_file = name
+                    break
+        
+        if style_file:
+            style_path = os.path.join(style_dir, style_file)
+            
+            # Chỉ thêm vào list nếu cả Content và Style đều tồn tại
+            if os.path.exists(content_path) and os.path.exists(style_path):
+                samples.append({
+                    "content": content_path,
+                    "style": style_path,
+                    "target": chi_path,
+                    "font_name": font_name,
+                    "glyph_name": glyph_name
+                })
+
+    print(f"✅ Đã ghép cặp thành công: {len(samples)} mẫu.")
+
+    # 5. Chạy Inference Loop
+    os.makedirs(args.save_dir, exist_ok=True)
     
-    # 4. Thực hiện Inference (Tạo ảnh)
-    print("Bắt đầu quá trình inference...")
     with torch.no_grad():
-        # Logic này khớp với validation.py dòng 102-104
-        
-        # A. Trích xuất Content từ ảnh nguồn (x_src)
-        # G_EMA.cnt_encoder trả về: c_src, skip1, skip2
-        c_src, skip1, skip2 = G_EMA.cnt_encoder(x_src)
-        
-        # B. Trích xuất Style từ ảnh tham chiếu (x_ref)
-        # C_EMA(..., sty=True) trả về s_ref
-        # Lưu ý: validation.py dùng x_ref_tmp lặp lại batch, ở đây ta inference 1 ảnh nên không cần repeat nếu batch=1
-        s_ref = C_EMA(x_ref, sty=True)
-        
-        # C. Tổng hợp và Giải mã
-        # G_EMA.decode trả về x_res_ema_tmp, _
-        x_res, _ = G_EMA.decode(c_src, s_ref, skip1, skip2)
+        for s in tqdm(samples, desc="🚀 Running Inference", ncols=100):
+            # Load Tensors
+            c_img = load_image_tensor(s["content"], args.img_size, device)
+            s_img = load_image_tensor(s["style"], args.img_size, device)
+            
+            if c_img is None or s_img is None:
+                continue
 
-    print("Inference hoàn tất. Chuẩn bị lưu kết quả.")
-    
-    # 5. Lưu kết quả
-    # Resize về dạng hiển thị tốt
-    output_grid = torch.cat([x_src, x_ref, x_res], dim=0)
-    
-    try:
-        vutils.save_image(
-            output_grid.cpu(), 
-            args.output_path, 
-            normalize=True, 
-            # nrow=3 để xếp ngang: Source | Reference | Result
-            nrow=3 
-        )
-        print(f"Đã lưu kết quả thành công tại: {args.output_path}")
-    except Exception as e:
-        print(f"Lỗi khi lưu ảnh: {e}")
+            # --- GAN FORWARD PASS ---
+            # 1. Extract Content
+            c_code, skip1, skip2 = G_EMA.cnt_encoder(c_img)
+            # 2. Extract Style
+            s_code = C_EMA(s_img, sty=True)
+            # 3. Decode / Generate
+            fake_img, _ = G_EMA.decode(c_code, s_code, skip1, skip2)
+            # ------------------------
+
+            # Save Results
+            # Tên file: Font_Glyph_Generated.png
+            safe_glyph = "".join([c if c.isalnum() else "_" for c in s["glyph_name"]]) # Xử lý ký tự đặc biệt
+            base_name = f"{s['font_name']}_{safe_glyph}"
+            
+            # 1. Lưu ảnh lẻ (Generated)
+            vutils.save_image(
+                fake_img, 
+                os.path.join(args.save_dir, f"{base_name}_gen.png"),
+                normalize=True, 
+                range=(-1, 1)
+            )
+
+            # 2. Lưu ảnh ghép (Content | Style | Gen) - Dễ so sánh
+            save_image_with_content_style(
+                save_dir=os.path.join(args.save_dir, "merged_view"),
+                gen_tensor=fake_img,
+                content_path=s["content"],
+                style_path=s["style"],
+                filename=f"{base_name}_merged.jpg"
+            )
+
+    print(f"\n🎉 Hoàn tất! Kết quả lưu tại: {args.save_dir}")
 
 def parse_args():
-    """
-    Định nghĩa và phân tích các đối số dòng lệnh.
-    """
-    parser = argparse.ArgumentParser(description="Inference Module for Content-Style Transfer Model")
-    parser.add_argument('--checkpoint_path', type=str, required=True,
-                        help='Đường dẫn đến file checkpoint (.pth) (VD: ./logs/model/checkpoint.pth)')
-    parser.add_argument('--source_image', type=str, required=True,
-                        help='Đường dẫn đến ảnh nguồn (Content/Ký tự).')
-    parser.add_argument('--reference_image', type=str, required=True,
-                        help='Đường dẫn đến ảnh tham chiếu (Style/Font).')
-    parser.add_argument('--output_path', type=str, default='result.jpg',
-                        help='Đường dẫn để lưu ảnh kết quả.')
+    parser = argparse.ArgumentParser(description="Inference GAN Font Generation")
     
-    # Các tham số mặc định khớp với main.py
-    parser.add_argument('--img_size', type=int, default=80, 
-                        help='Kích thước ảnh đầu vào (main.py default=80).')
-    parser.add_argument('--sty_dim', type=int, default=128,
-                        help='Kích thước vector style (main.py default=128).')
-    parser.add_argument('--output_k', type=int, default=400,
-                        help='Tổng số lớp/styles (main.py default=400).')
-    
-    parser.add_argument('--gpu', type=int, default=0,
-                        help='Chỉ mục GPU để sử dụng.')
+    # Paths
+    parser.add_argument('--checkpoint_path', type=str, required=True, help='Path to .pth model')
+    parser.add_argument('--source_dir', type=str, required=True, help='Folder chứa ảnh Content gốc (Source)')
+    parser.add_argument('--chinese_dir', type=str, required=True, help='Folder chứa ảnh Target (Chinese) - Dùng để duyệt danh sách')
+    parser.add_argument('--english_dir', type=str, required=True, help='Folder chứa ảnh Style (English)')
+    parser.add_argument('--save_dir', type=str, default='./results', help='Folder lưu kết quả')
+
+    # Style Logic
+    parser.add_argument("--random_style", action="store_true", help="Chọn style ngẫu nhiên từ folder English")
+    parser.add_argument("--random_mode", type=str, default="full", choices=["full", "upper"], help="Chế độ random")
+    parser.add_argument("--fixed_style", type=str, default="A", help="Tên file style cố định (VD: A, A+, a) nếu không dùng random")
+
+    # Model Params
+    parser.add_argument('--img_size', type=int, default=80, help='Kích thước ảnh model (default: 80)')
+    parser.add_argument('--sty_dim', type=int, default=128, help='Style vector dimension')
+    parser.add_argument('--output_k', type=int, default=400, help='Số class output của GuidingNet')
+    parser.add_argument('--gpu', type=int, default=0, help='GPU ID (-1 for CPU)')
 
     return parser.parse_args()
 
