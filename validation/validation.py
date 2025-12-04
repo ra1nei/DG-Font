@@ -41,34 +41,19 @@ def validateUN(data_loader, networks, epoch, args, additional=None):
     with torch.no_grad():
         val_tot_tars = torch.tensor(val_dataset.targets)
         for cls_idx in range(len(args.att_to_use)):
-            tmp_cls_set_all = (val_tot_tars == args.att_to_use[cls_idx]).nonzero()
-            num_to_take = min(len(tmp_cls_set_all), args.val_num)
-
-            if num_to_take > 0:
-                tmp_cls_set = tmp_cls_set_all[-num_to_take:]
-            else:
-                tmp_cls_set = torch.empty((0, 1), dtype=torch.long)
-            
-            tmp_ds = torch.utils.data.Subset(val_dataset, tmp_cls_set.flatten())
-            tmp_dl = torch.utils.data.DataLoader(tmp_ds, batch_size=args.val_num, shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
+            tmp_cls_set = (val_tot_tars == args.att_to_use[cls_idx]).nonzero()[-args.val_num:]
+            tmp_ds = torch.utils.data.Subset(val_dataset, tmp_cls_set)
+            tmp_dl = torch.utils.data.DataLoader(tmp_ds, batch_size=args.val_num, shuffle=False,
+                                                 num_workers=0, pin_memory=True, drop_last=False)
             tmp_iter = iter(tmp_dl)
-            
             tmp_sample = None
-            if len(tmp_dl) == 0:
-                print(f"Warning: No images found for class index {cls_idx} (Val Set).")
-                continue
-            else:
-                for sample_idx in range(len(tmp_iter)):
-                    imgs, _ = next(tmp_iter)
-                    x_ = imgs
-                    if tmp_sample is None:
-                        tmp_sample = x_.clone()
-                    else:
-                        tmp_sample = torch.cat((tmp_sample, x_), 0)
-            
-            if tmp_sample is None:
-                 raise ValueError(f"Validation set empty for class {args.att_to_use[cls_idx]}")
-                 
+            for sample_idx in range(len(tmp_iter)):
+                imgs, _ = next(tmp_iter)
+                x_ = imgs
+                if tmp_sample is None:
+                    tmp_sample = x_.clone()
+                else:
+                    tmp_sample = torch.cat((tmp_sample, x_), 0)
             x_each_cls.append(tmp_sample)
     
     
