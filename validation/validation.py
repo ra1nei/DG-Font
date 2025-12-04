@@ -70,6 +70,9 @@ def validateUN(data_loader, networks, epoch, args, additional=None):
                     x_res_ema = torch.cat((ones, x_src), 0)
                     x_rnd_ema = torch.cat((ones, x_src_rnd), 0)
                     x_ref = x_each_cls[ref_idx][:args.val_batch, :, :, :].cuda(args.gpu, non_blocking=True)
+
+                    print(x_ref)
+
                     rnd_idx = torch.randperm(x_each_cls[ref_idx].size(0))[:args.val_batch]
                     x_ref_rnd = x_each_cls[ref_idx][rnd_idx].cuda(args.gpu, non_blocking=True)
                     for sample_idx in range(args.val_batch):
