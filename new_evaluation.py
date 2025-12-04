@@ -84,6 +84,10 @@ def evaluate_folder(root_folder_path, output_path=None, device='cuda' if torch.c
     results = []
     gen_fid_updates = []
     gt_fid_updates = []
+    
+    # Biến đếm để in ra 3 ví dụ đầu tiên
+    example_count = 0
+    max_examples = 3
 
     # 4. Duyệt và đánh giá từng cặp ảnh
     for gen_file in tqdm(generated_files, desc="🔄 Đang đánh giá"):
@@ -91,26 +95,31 @@ def evaluate_folder(root_folder_path, output_path=None, device='cuda' if torch.c
         # Tên file GT tương ứng: Font_Glyph_gt.png
         
         # Tạo tên file GT dựa trên tên file Generated
-        base_name_without_suffix = gen_file.rsplit('_', 1)[0] # Bỏ _gen.png hoặc _gen.jpg
-        gt_file = f"{base_name_without_suffix}_gt.png"
-
-        gen_path = os.path.join(gen_folder, gen_file)
-        gt_path = os.path.join(gt_folder, gt_file)
+        # Bỏ đuôi file (.png, .jpg) trước khi tìm hậu tố
+        base_filename = os.path.splitext(gen_file)[0]
+        base_name_without_suffix = base_filename.rsplit('_', 1)[0] # Bỏ _gen
         
-        # Xử lý trường hợp file Generated không có đuôi .png
+        gt_file_base = f"{base_name_without_suffix}_gt"
+
+        # Kiểm tra cả 2 định dạng file GT (.png và .jpg)
+        gt_path = os.path.join(gt_folder, f"{gt_file_base}.png")
         if not os.path.exists(gt_path):
-            gt_file = f"{base_name_without_suffix}_gt.jpg"
-            gt_path = os.path.join(gt_folder, gt_file)
+            gt_path = os.path.join(gt_folder, f"{gt_file_base}.jpg")
             
             if not os.path.exists(gt_path):
-                # Thử tìm file GT với tên file Generated y hệt (nếu có lỗi logic tên file)
-                # Đây là fallback nếu logic đặt tên file không chuẩn
-                # gt_path_fallback = os.path.join(gt_folder, gen_file.replace("_gen", "_gt"))
-                # if os.path.exists(gt_path_fallback):
-                #     gt_path = gt_path_fallback
-                # else:
                 print(f"⚠️ Missing GT file cho {gen_file}. Đã bỏ qua.")
                 continue
+
+        gen_path = os.path.join(gen_folder, gen_file)
+        
+        # --- In ra ví dụ để kiểm tra ---
+        if example_count < max_examples:
+            print(f"\n[VÍ DỤ {example_count + 1}]")
+            print(f"  > Generated: {gen_path}")
+            print(f"  > Ground Truth: {gt_path}")
+            example_count += 1
+        # -------------------------------
+
 
         # Tải ảnh (ảnh đã ở dải [0, 1])
         gen_img = load_image(gen_path)
@@ -124,7 +133,7 @@ def evaluate_folder(root_folder_path, output_path=None, device='cuda' if torch.c
 
         # Kiểm tra kích thước tensor trước khi tính toán
         if gen_img.shape != gt_img.shape:
-             print(f"❌ Bỏ qua cặp {gen_file} và {gt_file}: Kích thước tensor khác nhau ({gen_img.shape} vs {gt_img.shape})")
+             print(f"❌ Bỏ qua cặp {gen_file} và {os.path.basename(gt_path)}: Kích thước tensor khác nhau ({gen_img.shape} vs {gt_img.shape})")
              continue
 
         # --- Per-image metrics ---
