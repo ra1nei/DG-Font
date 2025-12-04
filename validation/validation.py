@@ -41,7 +41,10 @@ def validateUN(data_loader, networks, epoch, args, additional=None):
     with torch.no_grad():
         val_tot_tars = torch.tensor(val_dataset.targets)
         for cls_idx in range(len(args.att_to_use)):
-            tmp_cls_set = (val_tot_tars == args.att_to_use[cls_idx]).nonzero()[-args.val_num:]
+            # Select all indices for the current class
+            tmp_cls_set_all = (val_tot_tars == args.att_to_use[cls_idx]).nonzero()
+            # Select the LAST args.val_num samples, or all of them if fewer than args.val_num exist
+            tmp_cls_set = tmp_cls_set_all[-min(len(tmp_cls_set_all), args.val_num):]
             tmp_ds = torch.utils.data.Subset(val_dataset, tmp_cls_set)
             tmp_dl = torch.utils.data.DataLoader(tmp_ds, batch_size=args.val_num, shuffle=False,
                                                  num_workers=0, pin_memory=True, drop_last=False)
