@@ -9,6 +9,7 @@ from torchvision import transforms
 from skimage.metrics import structural_similarity as ssim
 from torchmetrics.image.fid import FrechetInceptionDistance
 import warnings
+import torchvision.utils as vutils # Thêm thư viện để lưu ảnh gộp
 
 # Tắt cảnh báo SSIM (thường xảy ra khi so sánh tensor)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -88,6 +89,10 @@ def evaluate_folder(root_folder_path, output_path=None, device='cuda' if torch.c
     # Biến đếm để in ra 3 ví dụ đầu tiên
     example_count = 0
     max_examples = 3
+    
+    # Thư mục lưu ảnh ví dụ đã gộp
+    example_save_dir = os.path.join(root_folder_path, "evaluation_examples")
+    os.makedirs(example_save_dir, exist_ok=True) # Tạo thư mục nếu chưa tồn tại
 
     # 4. Duyệt và đánh giá từng cặp ảnh
     for gen_file in tqdm(generated_files, desc="🔄 Đang đánh giá"):
@@ -112,15 +117,6 @@ def evaluate_folder(root_folder_path, output_path=None, device='cuda' if torch.c
 
         gen_path = os.path.join(gen_folder, gen_file)
         
-        # --- In ra ví dụ để kiểm tra ---
-        if example_count < max_examples:
-            print(f"\n[VÍ DỤ {example_count + 1}]")
-            print(f"  > Generated: {gen_path}")
-            print(f"  > Ground Truth: {gt_path}")
-            example_count += 1
-        # -------------------------------
-
-
         # Tải ảnh (ảnh đã ở dải [0, 1])
         gen_img = load_image(gen_path)
         gt_img = load_image(gt_path)
@@ -135,6 +131,30 @@ def evaluate_folder(root_folder_path, output_path=None, device='cuda' if torch.c
         if gen_img.shape != gt_img.shape:
              print(f"❌ Bỏ qua cặp {gen_file} và {os.path.basename(gt_path)}: Kích thước tensor khác nhau ({gen_img.shape} vs {gt_img.shape})")
              continue
+
+        # --- In ra ví dụ để kiểm tra và gộp ảnh ---
+        if example_count < max_examples:
+            print(f"\n[VÍ DỤ {example_count + 1}]")
+            print(f"  > Generated: {gen_path}")
+            print(f"  > Ground Truth: {gt_path}")
+            
+            # Gộp ảnh và lưu
+            try:
+                # Gộp ảnh Generated và Ground Truth side-by-side (theo chiều rộng W, dim=3)
+                merged_tensor = torch.cat([gen_img.cpu(), gt_img.cpu()], dim=3)
+                
+                example_filename = f"Example_{example_count + 1}_{base_name_without_suffix}.png"
+                example_save_path = os.path.join(example_save_dir, example_filename)
+                
+                # Lưu ảnh. Squeeze(0) loại bỏ batch dimension [1, C, H, 2*W] -> [C, H, 2*W]
+                vutils.save_image(merged_tensor.squeeze(0), example_save_path, normalize=False)
+                
+                print(f"  > Merged Example Saved: {example_save_path}")
+            except Exception as e:
+                print(f"  > ❌ Lỗi khi gộp và lưu ảnh ví dụ: {e}")
+                
+            example_count += 1
+        # -------------------------------------------
 
         # --- Per-image metrics ---
         l1_val = l1_loss(gen_img, gt_img)
