@@ -1,0 +1,16 @@
+transformers==4.33.1
+accelerate==0.23.0
+diffusers==0.22.0
+huggingface-hub==0.25.2
+gradio==4.8.0
+pyyaml
+pygame
+opencv-python
+info-nce-pytorch
+kornia
+torchvision
+wandb
+gdown
+lpips
+torch-fidelity
+torchmetrics
