@@ -22,19 +22,22 @@ except ImportError:
 # UTILS
 # ======================
 
-def load_image_tensor(path, size, device):
+def load_image_tensor(path, size, device, normalize=True):
     """
     Load ảnh, resize, và chuẩn hóa về [-1, 1] cho GAN
     """
     if not os.path.exists(path):
         return None
     
-    # Transform chuẩn cho GAN (thường là mean 0.5, std 0.5 để về range [-1, 1])
-    tfm = transforms.Compose([
+    # Transform chuẩn cho GAN (mean 0.5, std 0.5 để về range [-1, 1])
+    transform_list = [
         transforms.Resize((size, size)),
         transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
+    ]
+    if normalize:
+        transform_list.append(transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)))
+
+    tfm = transforms.Compose(transform_list)
     
     try:
         img = Image.open(path).convert("RGB")
@@ -50,15 +53,17 @@ def save_image_with_content_style(save_dir, gen_tensor, content_path, style_path
     os.makedirs(save_dir, exist_ok=True)
     
     # Denormalize generated tensor từ [-1, 1] về [0, 1] để lưu
-    gen_tensor = (gen_tensor.clone().detach().cpu() * 0.5 + 0.5).clamp(0, 1)
+    # gen_tensor đã được clone.detach() ở vòng lặp chính
+    gen_tensor_norm = (gen_tensor.cpu() * 0.5 + 0.5).clamp(0, 1)
     
     # Convert sang PIL
-    gen_pil = transforms.ToPILImage()(gen_tensor.squeeze(0))
+    gen_pil = transforms.ToPILImage()(gen_tensor_norm.squeeze(0))
     
     # Resize các ảnh khác về cùng kích thước với Gen
     W, H = gen_pil.size
     
     try:
+        # Load Content và Style không cần chuẩn hóa
         content_pil = Image.open(content_path).convert("RGB").resize((W, H))
         style_pil = Image.open(style_path).convert("RGB").resize((W, H))
         
@@ -155,42 +160,28 @@ def run_inference(args):
         glyph_name = os.path.splitext(os.path.basename(chi_path))[0] # Tên chữ (vd: 丁)
 
         # A. Xác định Content Path (Source)
-        # Giả định source nằm trong args.source_dir/GlyphName.png
-        # (Hoặc nếu source cũng chia folder thì cần sửa lại logic này tùy cấu trúc source của bạn)
-        # Theo đề bài: "lấy glyph của ảnh đó trong source làm ảnh content" -> source_dir/glyph_name.png
         content_path = os.path.join(args.source_dir, f"{glyph_name}.png")
         
-        # Fallback nếu trong source nó nằm trong folder con (ví dụ source/A+/glyph.png)
-        if not os.path.exists(content_path):
-             # Thử tìm đệ quy hoặc giả định một cấu trúc khác nếu cần. 
-             # Hiện tại giữ simple: source_dir/glyph.png
-             pass
-
         # B. Xác định Style Path (English)
-        # Style nằm trong: english_dir/FontName/...
         style_dir = os.path.join(args.english_dir, font_name)
         
         if not os.path.exists(style_dir):
-            continue # Không có folder style tương ứng font này -> Skip
+            continue 
 
         # Logic chọn file Style (Random vs Fixed)
         style_file = None
         
         if args.random_style:
-            # Lấy danh sách ảnh trong folder style đó
             candidates = [f for f in os.listdir(style_dir) if f.lower().endswith(('.png', '.jpg'))]
             
-            # Lọc theo mode nếu cần (ví dụ chỉ lấy chữ hoa)
             if args.random_mode == "upper":
-                # Lọc thô sơ: Tên file dài 1 ký tự và là chữ hoa (A.png) hoặc A+.png
                 candidates = [f for f in candidates if f[0].isupper()]
             
             if candidates:
                 style_file = random.choice(candidates)
         else:
-            # Fixed style (ví dụ chọn 'A+.png' hoặc 'a.png')
-            # Thử tìm file chính xác
-            possible_names = [args.fixed_style, args.fixed_style + ".png", args.fixed_style + ".jpg"]
+            style_file_base = args.fixed_style
+            possible_names = [f"{style_file_base}", f"{style_file_base}.png", f"{style_file_base}.jpg"]
             for name in possible_names:
                 if os.path.exists(os.path.join(style_dir, name)):
                     style_file = name
@@ -199,7 +190,6 @@ def run_inference(args):
         if style_file:
             style_path = os.path.join(style_dir, style_file)
             
-            # Chỉ thêm vào list nếu cả Content và Style đều tồn tại
             if os.path.exists(content_path) and os.path.exists(style_path):
                 samples.append({
                     "content": content_path,
@@ -212,7 +202,14 @@ def run_inference(args):
     print(f"✅ Đã ghép cặp thành công: {len(samples)} mẫu.")
 
     # 5. Chạy Inference Loop
-    os.makedirs(args.save_dir, exist_ok=True)
+    
+    # Tạo các thư mục output cần thiết cho FID
+    gen_dir = os.path.join(args.save_dir, 'generated_images')
+    gt_dir = os.path.join(args.save_dir, 'gt_images')
+    merged_dir = os.path.join(args.save_dir, 'merged_view')
+    os.makedirs(gen_dir, exist_ok=True)
+    os.makedirs(gt_dir, exist_ok=True)
+    os.makedirs(merged_dir, exist_ok=True)
     
     with torch.no_grad():
         for s in tqdm(samples, desc="🚀 Running Inference", ncols=100):
@@ -224,39 +221,45 @@ def run_inference(args):
                 continue
 
             # --- GAN FORWARD PASS ---
-            # 1. Extract Content
             c_code, skip1, skip2 = G_EMA.cnt_encoder(c_img)
-            # 2. Extract Style
             s_code = C_EMA(s_img, sty=True)
-            # 3. Decode / Generate
             fake_img, _ = G_EMA.decode(c_code, s_code, skip1, skip2)
             # ------------------------
 
             # Save Results
-            # Tên file: Font_Glyph_Generated.png
-            safe_glyph = "".join([c if c.isalnum() else "_" for c in s["glyph_name"]]) # Xử lý ký tự đặc biệt
+            safe_glyph = "".join([c if c.isalnum() else "_" for c in s["glyph_name"]]) 
             base_name = f"{s['font_name']}_{safe_glyph}"
             
+            # CHUẨN HÓA VỀ [0, 1] cho việc lưu ảnh
             normalized_fake_img = (fake_img.clone().detach() * 0.5 + 0.5).clamp(0, 1)
-            
-            # 1. Lưu ảnh lẻ (Generated)
-            # Dùng normalize=False vì ảnh đã được chuẩn hóa thủ công
+
+            # 1. LƯU ẢNH GENERATED (Dành cho FID)
             vutils.save_image(
                 normalized_fake_img, 
-                os.path.join(args.save_dir, f"{base_name}_gen.png"),
-                normalize=False,  # Bỏ normalize=True và tham số range
+                os.path.join(gen_dir, f"{base_name}_gen.png"),
+                normalize=False, 
             )
+            
+            # 2. LƯU ẢNH GROUND TRUTH (Dành cho FID)
+            # Load ảnh target (chi_path) không cần chuẩn hóa [-1, 1], chỉ cần resize và ToTensor [0, 1]
+            gt_img_tensor = load_image_tensor(s["target"], args.img_size, device, normalize=False)
+            if gt_img_tensor is not None:
+                vutils.save_image(
+                    gt_img_tensor, 
+                    os.path.join(gt_dir, f"{base_name}_gt.png"),
+                    normalize=False,
+                )
 
-            # 2. Lưu ảnh ghép (Content | Style | Gen) - Hàm này đã được sửa bên trong
+            # 3. Lưu ảnh ghép (Content | Style | Gen) - Dễ so sánh
             save_image_with_content_style(
-                save_dir=os.path.join(args.save_dir, "merged_view"),
-                gen_tensor=fake_img, # Vẫn truyền tensor [-1, 1] vì hàm save_image_with_content_style xử lý
+                save_dir=merged_dir,
+                gen_tensor=fake_img,
                 content_path=s["content"],
                 style_path=s["style"],
                 filename=f"{base_name}_merged.jpg"
             )
 
-    print(f"\n🎉 Hoàn tất! Kết quả lưu tại: {args.save_dir}")
+    print(f"\n🎉 Hoàn tất! Kết quả lưu tại:\n- Generated: {gen_dir}\n- GroundTruth: {gt_dir}\n- Merged View: {merged_dir}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Inference GAN Font Generation")
