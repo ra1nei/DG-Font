@@ -237,18 +237,20 @@ def run_inference(args):
             safe_glyph = "".join([c if c.isalnum() else "_" for c in s["glyph_name"]]) # Xử lý ký tự đặc biệt
             base_name = f"{s['font_name']}_{safe_glyph}"
             
+            normalized_fake_img = (fake_img.clone().detach() * 0.5 + 0.5).clamp(0, 1)
+            
             # 1. Lưu ảnh lẻ (Generated)
+            # Dùng normalize=False vì ảnh đã được chuẩn hóa thủ công
             vutils.save_image(
-                fake_img, 
+                normalized_fake_img, 
                 os.path.join(args.save_dir, f"{base_name}_gen.png"),
-                normalize=True, 
-                range=(-1, 1)
+                normalize=False,  # Bỏ normalize=True và tham số range
             )
 
-            # 2. Lưu ảnh ghép (Content | Style | Gen) - Dễ so sánh
+            # 2. Lưu ảnh ghép (Content | Style | Gen) - Hàm này đã được sửa bên trong
             save_image_with_content_style(
                 save_dir=os.path.join(args.save_dir, "merged_view"),
-                gen_tensor=fake_img,
+                gen_tensor=fake_img, # Vẫn truyền tensor [-1, 1] vì hàm save_image_with_content_style xử lý
                 content_path=s["content"],
                 style_path=s["style"],
                 filename=f"{base_name}_merged.jpg"
