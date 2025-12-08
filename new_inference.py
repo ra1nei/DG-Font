@@ -267,8 +267,8 @@ def parse_args():
     # Paths
     parser.add_argument('--checkpoint_path', type=str, required=True, help='Path to .pth model')
     parser.add_argument('--source_dir', type=str, required=True, help='Folder chứa ảnh Content gốc (Source)')
-    parser.add_argument('--chinese_dir', type=str, required=True, help='Folder chứa ảnh Target (Chinese) - Dùng để duyệt danh sách')
-    parser.add_argument('--english_dir', type=str, required=True, help='Folder chứa ảnh Style (English)')
+    parser.add_argument('--content_dir', type=str, required=True, help='Folder chứa ảnh Target (Chinese) - Dùng để duyệt danh sách')
+    parser.add_argument('--style_dir', type=str, required=True, help='Folder chứa ảnh Style (English)')
     parser.add_argument('--save_dir', type=str, default='./results', help='Folder lưu kết quả')
 
     # Style Logic
