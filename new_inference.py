@@ -144,8 +144,8 @@ def run_inference(args):
         return
 
     # 3. Thu thập danh sách ảnh Target (Chinese)
-    print(f"📂 Đang quét thư mục target: {args.chinese_dir}")
-    chinese_images = collect_files(args.chinese_dir)
+    print(f"📂 Đang quét thư mục target: {args.content_dir}")
+    chinese_images = collect_files(args.content_dir)
     print(f"📊 Tìm thấy {len(chinese_images)} ảnh target.")
 
     # 4. Chuẩn bị danh sách samples (Matching logic)
