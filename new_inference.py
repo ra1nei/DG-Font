@@ -163,7 +163,7 @@ def run_inference(args):
         content_path = os.path.join(args.source_dir, f"{glyph_name}.png")
         
         # B. Xác định Style Path (English)
-        style_dir = os.path.join(args.english_dir, font_name)
+        style_dir = os.path.join(args.style_dir, font_name)
         
         if not os.path.exists(style_dir):
             continue 
